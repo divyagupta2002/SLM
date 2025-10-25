@@ -1,0 +1,29 @@
+model:
+  vocab_size: 4096
+  embed_dim: 64
+  num_heads: 4
+  num_layers: 4
+  ff_hidden_dim: 128  # Optional, defaults to 2 * embed_dim if not provided
+
+data:
+  tokenizer_path: "tokenizer/bpe_4096.json"
+  data_path: "data/100-0.txt"
+  context_size: 1024
+  batch_size: 64
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+training:
+  epochs: 7
+  learning_rate: 0.001
+  ckpt_path: "checkpoints/model_latest.pth"
+  logdir: "runs/experiment_2"
+  grad_clip: 1.0
+  grad_accum_steps: 2
+  warmup_steps: 100
+  use_amp: true
+  save_every: 5
+  log_every: 1
+  eval_every: 1
