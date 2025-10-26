@@ -1,27 +1,14 @@
-from pathlib import Path
+import os
 from typing import List, Tuple, Optional
-from dataclasses import dataclass
 
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, random_split
 from tokenizers import Tokenizer
 from tokenizers import models, pre_tokenizers, decoders, trainers
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class DataConfig:
-    tokenizer_path: str
-    data_path: str
-    context_size: int
-    batch_size: int
-    val_split: float = 0.1
-    num_workers: int = 4
-    pin_memory: bool = True
-    prefetch_factor: int = 2
 
 
 class TextDataset(Dataset):
@@ -51,17 +38,16 @@ class TextDataset(Dataset):
 
 
 def load_tokenizer(tokenizer_path: str) -> Tokenizer:
-    path = Path(tokenizer_path)
-    if not path.exists():
+    if os.path.exists(tokenizer_path):
+        try:
+            tokenizer = Tokenizer.from_file(tokenizer_path)
+            logger.info(f"Tokenizer loaded from {tokenizer_path}")
+            return tokenizer
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer from {tokenizer_path}: {e}")
+            raise
+    else:
         raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
-    
-    try:
-        tokenizer = Tokenizer.from_file(str(path))
-        logger.info(f"Tokenizer loaded from {tokenizer_path}")
-        return tokenizer
-    except Exception as e:
-        logger.error(f"Failed to load tokenizer from {tokenizer_path}: {e}")
-        raise
 
 
 def train_tokenizer(
@@ -71,7 +57,7 @@ def train_tokenizer(
     min_frequency: int = 2
 ) -> Tokenizer:
     for file_path in data_files:
-        if not Path(file_path).exists():
+        if not os.path.exists(file_path):
             raise FileNotFoundError(f"Data file not found: {file_path}")
     
     tokenizer = Tokenizer(models.BPE())
@@ -81,7 +67,7 @@ def train_tokenizer(
     trainer = trainers.BpeTrainer(vocab_size=vocab_size, min_frequency=min_frequency)
     tokenizer.train(data_files, trainer)
     
-    Path(tokenizer_path).parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(os.path.dirname(tokenizer_path), exist_ok=True)
     tokenizer.save(tokenizer_path)
     logger.info(f"Tokenizer trained and saved to {tokenizer_path}")
     
@@ -89,12 +75,10 @@ def train_tokenizer(
 
 
 def load_and_encode_text(data_path: str, tokenizer: Tokenizer) -> List[int]:
-    path = Path(data_path)
-    if not path.exists():
+    if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data file not found: {data_path}")
     
-    logger.info(f"Loading text from {data_path}")
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(data_path, 'r', encoding='utf-8') as f:
         text = f.read()
     
     encoded = tokenizer.encode(text).ids
@@ -103,57 +87,22 @@ def load_and_encode_text(data_path: str, tokenizer: Tokenizer) -> List[int]:
     return encoded
 
 
-def create_dataloaders(
-    config: DataConfig,
-    tokenizer: Optional[Tokenizer] = None
-) -> Tuple[DataLoader, DataLoader]:
-    if tokenizer is None:
-        tokenizer = load_tokenizer(config.tokenizer_path)
-    
-    tokens = load_and_encode_text(config.data_path, tokenizer)
-    dataset = TextDataset(tokens, config.context_size)
-    
-    val_size = int(len(dataset) * config.val_split)
+def create_train_val_datasets(
+    data_path: str,
+    tokenizer_path: str,
+    context_size: int,
+    val_split: float = 0.1
+) -> Tuple[Dataset, Dataset]:
+    tokenizer = load_tokenizer(tokenizer_path)
+    tokens = load_and_encode_text(data_path, tokenizer)
+    dataset = TextDataset(tokens, context_size)
+    val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     
-    if train_size <= 0 or val_size <= 0:
-        raise ValueError(
-            f"Invalid split: train_size={train_size}, val_size={val_size}. "
-            f"Dataset has {len(dataset)} samples with {config.val_split} val_split."
-        )
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    logger.info(f"Created train dataset of size {train_size} and validation dataset of size {val_size}")
     
-    train_dataset, val_dataset = random_split(
-        dataset, 
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-        persistent_workers=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-        persistent_workers=True
-    )
-    
-    logger.info(
-        f"DataLoaders created: {train_size} train samples, "
-        f"{val_size} val samples, batch_size={config.batch_size}"
-    )
-    
-    return train_loader, val_loader
+    return train_dataset, val_dataset
 
 
 def encode_texts(tokenizer: Tokenizer, texts: List[str]) -> List[List[int]]:
