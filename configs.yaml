@@ -4,6 +4,7 @@ model:
   num_heads: 4
   num_layers: 4
   ff_hidden_dim: 128  # Optional, defaults to 2 * embed_dim if not provided
+  dropout: 0.1  # Dropout probability for regularization
 
 data:
   tokenizer_path: "tokenizer/bpe_4096.json"
@@ -21,7 +22,7 @@ training:
   learning_rate: 0.001
   grad_clip: 1.0
   grad_accum_steps: 2
-  logdir: "runs/experiment_1.3"
+  logdir: "runs/experiment_1.4"
   eval_every: 1
   save_every: 5
   checkpoint_path: "checkpoints/model_latest.pth"

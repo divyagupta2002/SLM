@@ -14,6 +14,7 @@ class ModelConfig:
     num_heads: int
     num_layers: int
     ff_hidden_dim: int
+    dropout: float = 0.1
         
 @dataclass
 class DataConfig:

@@ -13,14 +13,14 @@ A compact Transformer language model with utilities for tokenizer management, si
 ### Project Layout
 ```
 SLM/
-├── configs.yaml           # YAML configuration consumed by Config dataclasses
-├── data.py                # Tokenizer helpers and Dataset definition
-├── data_parallel_train.py # DDP training entry point
-├── infer.py               # Prompt-based text generation script
-├── model.py               # Transformer decoder implementation
-├── requirements.txt       # Project dependencies
-├── train.py               # Single-GPU training loop with evaluation
 ├── utils.py               # Config dataclasses and YAML loader
+├── data.py                # Tokenizer helpers and Dataset definition
+├── model.py               # Transformer decoder implementation
+├── infer.py               # Prompt-based text generation script
+├── train.py               # Single-GPU training loop with evaluation
+├── data_parallel_train.py # DDP training entry point
+├── configs.yaml           # YAML configuration consumed by Config dataclasses
+├── requirements.txt       # Project dependencies
 └── tokenizer/             # Stores pretrained or newly trained tokenizers
 ```
 

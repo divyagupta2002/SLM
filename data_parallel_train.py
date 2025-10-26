@@ -1,19 +1,19 @@
 import os
 import torch
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.nn.utils import clip_grad_norm_
 
-from utils import Config
 from model import Model
+from utils import Config
 from data import create_train_val_datasets
 
-from tqdm import tqdm
 import logging
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +30,6 @@ def cleanup():
 # -----------------------------
 # 2. Trainer
 # -----------------------------
-
 class DistributedTrainer:
     def __init__(self, model, train_dataset, val_dataset, batch_size, gpu_id, training_config):
         self.gpu_id = gpu_id
@@ -41,7 +40,6 @@ class DistributedTrainer:
         self.grad_clip = training_config.grad_clip
 
         self.epochs_ran = 0
-        self.btach_size = batch_size
         self.num_epochs = training_config.epochs
         self.writer = SummaryWriter(log_dir=training_config.logdir) if gpu_id == 0 else None
         self.eval_every = training_config.eval_every
@@ -50,14 +48,17 @@ class DistributedTrainer:
 
         self.loss_fn = torch.nn.CrossEntropyLoss()
 
+        os.makedirs(os.path.dirname(self.snapshot_path), exist_ok=True)
         if os.path.exists(self.snapshot_path):
             self._load_snapshot(self.snapshot_path, map_location=f"cuda:{gpu_id}")
             logger.info(f"Loaded model snapshot from {self.snapshot_path} on GPU {gpu_id} with epoch {self.epochs_ran}")
 
+
         self.model = DDP(self.model, device_ids=[self.gpu_id])
         self.train_dataloader, self.ep_steps = self._prepare_dataloader(train_dataset, batch_size)
         self.val_dataloader, self.val_steps = self._prepare_dataloader(val_dataset, batch_size, shuffle=False)
-        self.total_steps = self.ep_steps * self.num_epochs * dist.get_world_size()
+        self.total_steps = self.num_epochs * self.ep_steps
+        assert self.warmup_steps < self.total_steps, "Warmup steps must be less than total training steps."
         logger.info(f"Trainer initialized on GPU {gpu_id} with {self.ep_steps} steps/epoch.")
 
     def _load_snapshot(self, path, map_location):
@@ -76,21 +77,28 @@ class DistributedTrainer:
         )
         return dataloader, len(dataloader)
 
-    def lambda_lr(self, current_step):
-        if current_step < self.warmup_steps:
-            return float(current_step) / float(self.warmup_steps)
-        progress = float(current_step - self.warmup_steps) / float(self.total_steps - self.warmup_steps)
-        return 0.5 * (1.0 + torch.cos(torch.pi * torch.tensor(progress)))
-        
+    def _get_scheduler(self, optimizer):
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.000001, end_factor=1.0, total_iters=self.warmup_steps)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=self.total_steps - self.warmup_steps)
 
+        lr_scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[self.warmup_steps]
+        )
+        return lr_scheduler
+        
     def train(self):
+        global_step = self.epochs_ran * self.ep_steps
+        best_val_loss = float('inf')
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=self.lambda_lr)
+        lr_scheduler = self._get_scheduler(optimizer)
         
         while self.epochs_ran < self.num_epochs:
             self.model.train()
             optimizer.zero_grad()
-            progress_bar = tqdm(self.train_dataloader, desc=f"GPU {self.gpu_id} Epoch {self.epochs_ran + 1}/{self.num_epochs}", position=self.gpu_id)
+            self.train_dataloader.sampler.set_epoch(self.epochs_ran)
+            progress_bar = tqdm(self.train_dataloader, desc=f"GPU {self.gpu_id} Epoch {self.epochs_ran + 1}/{self.num_epochs}", position=self.gpu_id, leave = False)
             for inputs, targets in progress_bar:
                 inputs, targets = inputs.to(self.gpu_id), targets.to(self.gpu_id)
 
@@ -104,11 +112,11 @@ class DistributedTrainer:
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-                dist.all_reduce(loss.detach(), op=dist.ReduceOp.SUM) # will get called on only after word_size steps, and not on every step
-
+                global_step += 1
+                reduced_loss = loss.detach().clone()
+                dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM) # will get called on only after word_size steps, and not on every step
                 if self.writer:
-                    avg_loss = loss.item() / dist.get_world_size()
-                    global_step = (self.epochs_ran*self.ep_steps + progress_bar.n) * dist.get_world_size()
+                    avg_loss = reduced_loss.item() / dist.get_world_size()
                     self.writer.add_scalar("Train/Loss", avg_loss, global_step)
                     self.writer.add_scalar("Train/LR", lr_scheduler.get_last_lr()[0], global_step)
             self.epochs_ran += 1
@@ -118,15 +126,21 @@ class DistributedTrainer:
                 logger.info(f"Saved model snapshot at epoch {self.epochs_ran} on GPU {self.gpu_id}")
             
             if self.epochs_ran % self.eval_every == 0:
-                self.evaluate()
-            
+                avg_val_loss = self.evaluate()
+                if self.gpu_id == 0 and avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    best_val_path = self.snapshot_path.replace('.pt', '_best.pt')
+                    self._save_snapshot(best_val_path)
 
+        if self.writer:
+            self.writer.close()
+        logger.info(f"Training complete on GPU {self.gpu_id}.")
 
     @torch.inference_mode()
     def evaluate(self):
         self.model.eval()
         total_loss = torch.tensor(0.0, device=self.gpu_id)
-        progress_bar = tqdm(self.val_dataloader, desc=f"GPU {self.gpu_id} Validation", position=self.gpu_id)
+        progress_bar = tqdm(self.val_dataloader, desc=f"GPU {self.gpu_id} Validation", position=self.gpu_id, leave=False)
         for inputs, targets in progress_bar:
             inputs, targets = inputs.to(self.gpu_id), targets.to(self.gpu_id)
 
@@ -135,20 +149,27 @@ class DistributedTrainer:
                 loss = self.loss_fn(outputs.view(-1, outputs.size(-1)), targets.view(-1))
 
             total_loss += loss
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
 
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         if self.writer:    
+            global_step = self.epochs_ran * self.ep_steps
             avg_loss = total_loss.item() / (self.val_steps * dist.get_world_size())
-            global_step = self.epochs_ran * self.ep_steps * dist.get_world_size()
             self.writer.add_scalar("Val/Loss", avg_loss, global_step)
             logger.info(f"Validation Loss at epoch {self.epochs_ran}: {avg_loss}")
+            return avg_loss
 
-    def _save_snapshot(self):
-        snapshot = {
-            'model_state_dict': self.model.module.state_dict(),
-            'epochs': self.epochs_ran
-        }
-        torch.save(snapshot, self.snapshot_path)
+    def _save_snapshot(self, snapshot_path=None):
+        try:
+            if snapshot_path is None:
+                snapshot_path = self.snapshot_path
+            snapshot = {
+                'model_state_dict': self.model.module.state_dict(),
+                'epochs': self.epochs_ran
+            }
+            torch.save(snapshot, snapshot_path)
+            logger.info(f"Snapshot saved at {snapshot_path} at epoch {self.epochs_ran}")
+        except Exception as e:
+            logger.error(f"Error saving snapshot: {e}")
 
 # -----------------------------
 # 3. Main function
@@ -159,13 +180,14 @@ def main(config_path: str):
     gpu_id = int(os.environ['LOCAL_RANK'])
     config = Config.from_yaml(config_path)
 
-    # Load or create model
+    # initialize model
     model = Model(
         vocab_size=config.model.vocab_size,
         embed_dim=config.model.embed_dim,
         num_heads=config.model.num_heads,
         ff_hidden_dim=config.model.ff_hidden_dim,
-        num_layers=config.model.num_layers
+        num_layers=config.model.num_layers,
+        dropout=config.model.dropout
     )
 
     # Load datasets
@@ -176,6 +198,7 @@ def main(config_path: str):
         val_split=config.data.val_split
     )
 
+    # Initialize trainer
     trainer = DistributedTrainer(
         model=model,
         train_dataset=train_dataset,

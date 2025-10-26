@@ -20,7 +20,8 @@ def initialize_model(config: ModelConfig) -> Model:
         embed_dim=config.embed_dim,
         num_heads=config.num_heads,
         ff_hidden_dim=config.ff_hidden_dim,
-        num_layers=config.num_layers
+        num_layers=config.num_layers,
+        dropout=config.dropout
     )
     model = model.to(device)
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")

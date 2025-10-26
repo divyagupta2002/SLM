@@ -2,13 +2,16 @@ import os
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.nn.utils import clip_grad_norm_
 
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 import logging
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-from utils import Config, TrainingConfig
 from model import Model
+from utils import Config, TrainingConfig
 from data import create_train_val_datasets
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +47,9 @@ class Trainer:
         self.save_every = training_config.save_every
         self.checkpoint_path = training_config.checkpoint_path
 
+        self.loss_fn = torch.nn.CrossEntropyLoss()
+
+        os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
         if os.path.exists(training_config.checkpoint_path):
             self._load_checkpoint(training_config.checkpoint_path)
             logger.info(f"Resuming training from checkpoint: {training_config.checkpoint_path}")
@@ -51,6 +57,7 @@ class Trainer:
         self.train_loader, self.ep_steps = self._get_dataloader(train_datset, batch_size)
         self.val_loader, self.val_steps = self._get_dataloader(val_dataset, batch_size, shuffle=False)
         self.total_steps = self.num_epochs * self.ep_steps
+        assert self.warmup_steps < self.total_steps, "Warmup steps must be less than total training steps."
         logger.info(f"Training for {self.num_epochs} epochs, starting from epoch {self.epochs_ran} on device {device}")
 
     def _load_checkpoint(self, checkpoint_path):
@@ -59,7 +66,7 @@ class Trainer:
         self.epochs_ran = checkpoint.get('epoch', 0)
 
     def _get_dataloader(self, dataset, batch_size, shuffle=True):
-        dataloader = torch.utils.data.DataLoader(
+        dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
@@ -69,42 +76,45 @@ class Trainer:
         steps = len(dataloader)
         return dataloader, steps
     
-    def lambda_lr(self, current_step):
-        if current_step < self.warmup_steps:
-            return float(current_step) / float(self.warmup_steps)
-        progress = float(current_step - self.warmup_steps) / float(self.total_steps - self.warmup_steps)
-        return 0.5 * (1.0 + torch.cos(torch.pi * torch.tensor(progress)))
+    def _get_scheduler(self, optimizer):
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.000001, end_factor=1.0, total_iters=self.warmup_steps)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=self.total_steps - self.warmup_steps)
+
+        lr_scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[self.warmup_steps]
+        )
+        return lr_scheduler
 
     def train(self):
         global_step = self.epochs_ran * self.ep_steps
         best_val_loss = float('inf')
-        loss_fn = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=self.lambda_lr)
+        lr_scheduler = self._get_scheduler(optimizer)
         
         while self.epochs_ran < self.num_epochs:
             self.model.train()
             optimizer.zero_grad()
-            pbar = tqdm(self.train_loader, desc=f"Epoch {self.epochs_ran + 1}/{self.num_epochs}")
+            pbar = tqdm(self.train_loader, desc=f"Epoch {self.epochs_ran + 1}/{self.num_epochs}", leave=False)
             for batch_idx, (inputs, targets) in enumerate(pbar):
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 with torch.amp.autocast(device_type=device.type, dtype = torch.bfloat16):
                     logits = self.model(inputs)
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+                    loss = self.loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
                     loss = loss / self.grad_accum_steps
                 # scaler.scale(loss).backward()
                 loss.backward()
                 if (batch_idx + 1) % self.grad_accum_steps == 0:
                     # scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    #scaler.step(optimizer)
-                    #scaler.update()
-                    optimizer.step()
+                    clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    optimizer.step() #scaler.step(optimizer)
                     lr_scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad() #scaler.update()
                 global_step += 1
-                self.writer.add_scalar('Train/Loss', loss.item() * self.grad_accum_steps, global_step)
+                avg_loss = loss.item() * self.grad_accum_steps
+                self.writer.add_scalar('Train/Loss', avg_loss, global_step)
                 self.writer.add_scalar('Train/Learning_Rate', lr_scheduler.get_last_lr()[0], global_step)
             self.epochs_ran += 1
 
@@ -115,10 +125,7 @@ class Trainer:
                 avg_val_loss = self.evaluate()
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
-                    best_ckpt_path = os.path.join(
-                        os.path.dirname(self.checkpoint_path), 
-                        'best_model.pth'
-                    )
+                    best_ckpt_path = self.checkpoint_path.replace('.pt', '_best.pt')
                 self._save_checkpoint(best_ckpt_path)  
             
         self.writer.close()
@@ -128,28 +135,34 @@ class Trainer:
     def evaluate(self) -> float:
         self.model.eval()
         total_loss = 0.0
-        for inputs, targets in tqdm(self.val_loader, desc="Validating", leave=False):
+        progress_bar = tqdm(self.val_loader, desc="Validating", leave=False)
+        for inputs, targets in progress_bar:
             inputs, targets = inputs.to(device), targets.to(device)
             
             with torch.amp.autocast(device_type=device.type, dtype = torch.bfloat16):        
                 logits = self.model(inputs)
                 loss = self.loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+
             total_loss += loss.item()
-        
+
+        global_step = self.epochs_ran * self.ep_steps
         avg_loss = total_loss / self.val_steps
-        self.writer.add_scalar('Val/Loss', avg_loss, self.epochs_ran * self.ep_steps)
+        self.writer.add_scalar('Val/Loss', avg_loss, global_step)
         logger.info(f"Validation Loss after epoch {self.epochs_ran}: {avg_loss:.4f}")
         return avg_loss
 
     def _save_checkpoint(self, ckpt_path = None):
-        if ckpt_path is None:
-            ckpt_path = self.checkpoint_path
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'epoch': self.epochs_ran
-        }
-        torch.save(checkpoint, ckpt_path)
-        logger.info(f"Checkpoint saved to {ckpt_path} at epoch {self.epochs_ran}")
+        try:
+            if ckpt_path is None:
+                ckpt_path = self.checkpoint_path
+            checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'epoch': self.epochs_ran
+            }
+            torch.save(checkpoint, ckpt_path)
+            logger.info(f"Checkpoint saved to {ckpt_path} at epoch {self.epochs_ran}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
 
 # -----------------------------
 # 4. Main function 
@@ -161,7 +174,8 @@ def main(config_path: str):
         embed_dim=config.model.embed_dim,
         num_heads=config.model.num_heads,
         ff_hidden_dim=config.model.ff_hidden_dim,
-        num_layers=config.model.num_layers
+        num_layers=config.model.num_layers,
+        dropout=config.model.dropout
     )
     train_dataset, val_dataset = create_train_val_datasets(
         data_path=config.data.data_path,

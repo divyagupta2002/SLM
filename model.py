@@ -5,16 +5,18 @@ from rotary_embedding_torch import RotaryEmbedding
 from einops import rearrange
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
         super(MultiHeadSelfAttention, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
 
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
         self.o_proj = nn.Linear(embed_dim, embed_dim)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, cache_max_seq_len=2048)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # qkv projection and reshape
@@ -27,23 +29,26 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.rotary_emb.rotate_queries_or_keys(k)
 
         # Scaled dot-product attention
-        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
         
         # Reshape back - use reshape instead of view when possible
         attn_output = rearrange(attn_output, 'b h s d -> b s (h d)')
         output = self.o_proj(attn_output)
+        output = self.resid_dropout(output)
         return output
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_hidden_dim):
+    def __init__(self, embed_dim, num_heads, ff_hidden_dim, dropout=0.1):
         super(DecoderBlock, self).__init__()
-        self.attention = MultiHeadSelfAttention(embed_dim, num_heads)
+        self.attention = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
         self.layernorm1 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, ff_hidden_dim),
             nn.GELU(),
-            nn.Linear(ff_hidden_dim, embed_dim)
+            nn.Dropout(dropout),
+            nn.Linear(ff_hidden_dim, embed_dim),
+            nn.Dropout(dropout)
         )
         self.layernorm2 = nn.LayerNorm(embed_dim)
 
@@ -62,15 +67,17 @@ class DecoderBlock(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_heads, ff_hidden_dim, num_layers):
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_hidden_dim, num_layers, dropout=0.1):
         super(Model, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.embed_dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            DecoderBlock(embed_dim, num_heads, ff_hidden_dim) for _ in range(num_layers)
+            DecoderBlock(embed_dim, num_heads, ff_hidden_dim, dropout) for _ in range(num_layers)
         ])
 
     def forward(self, x):
         x = self.embed(x)
+        x = self.embed_dropout(x)
         for block in self.blocks:
             x = block(x)
         logits = torch.matmul(x, self.embed.weight.T) # Weight tying
