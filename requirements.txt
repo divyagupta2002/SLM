@@ -1,2 +1,6 @@
 torch
 tokenizers
+tqdm
+rotary-embedding-torch
+einops
+tensorboard
