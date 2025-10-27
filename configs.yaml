@@ -19,7 +19,7 @@ data:
 training:
   epochs: 15
   warmup_steps: 100
-  learning_rate: 0.001
+  learning_rate: 0.01
   grad_clip: 1.0
   grad_accum_steps: 2
   logdir: "runs/experiment_1.4"

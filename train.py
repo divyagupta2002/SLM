@@ -33,6 +33,7 @@ class Trainer:
     ):
         self.model = model
         self.model = self.model.to(device)
+        self.model = torch.compile(self.model)
 
         self.warmup_steps = training_config.warmup_steps
         self.lr = training_config.learning_rate

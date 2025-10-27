@@ -32,7 +32,11 @@ def load_checkpoint(model: Model, ckpt_path: str) -> Model:
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = checkpoint['model_state_dict']
+    # check if the keys starts with _orig_mod
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     
     epoch = checkpoint.get('epoch', 0)
     logger.info(f"Checkpoint loaded from {ckpt_path} (epoch {epoch})")

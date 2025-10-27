@@ -34,6 +34,7 @@ class DistributedTrainer:
     def __init__(self, model, train_dataset, val_dataset, batch_size, gpu_id, training_config):
         self.gpu_id = gpu_id
         self.model = model.to(gpu_id)
+        self.model = torch.compile(self.model)
 
         self.warmup_steps = training_config.warmup_steps
         self.lr = training_config.learning_rate
@@ -114,9 +115,9 @@ class DistributedTrainer:
 
                 global_step += 1
                 reduced_loss = loss.detach().clone()
-                dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM) # will get called on only after word_size steps, and not on every step
+                dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG) # will get called on only after word_size steps, and not on every step
                 if self.writer:
-                    avg_loss = reduced_loss.item() / dist.get_world_size()
+                    avg_loss = reduced_loss.item() 
                     self.writer.add_scalar("Train/Loss", avg_loss, global_step)
                     self.writer.add_scalar("Train/LR", lr_scheduler.get_last_lr()[0], global_step)
             self.epochs_ran += 1
@@ -150,10 +151,10 @@ class DistributedTrainer:
 
             total_loss += loss
 
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
         if self.writer:    
             global_step = self.epochs_ran * self.ep_steps
-            avg_loss = total_loss.item() / (self.val_steps * dist.get_world_size())
+            avg_loss = total_loss.item() / self.val_steps
             self.writer.add_scalar("Val/Loss", avg_loss, global_step)
             logger.info(f"Validation Loss at epoch {self.epochs_ran}: {avg_loss}")
             return avg_loss
@@ -174,7 +175,6 @@ class DistributedTrainer:
 # -----------------------------
 # 3. Main function
 # -----------------------------
-
 def main(config_path: str):
     setup()
     gpu_id = int(os.environ['LOCAL_RANK'])
