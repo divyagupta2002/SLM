@@ -115,7 +115,7 @@ class DistributedTrainer:
 
                 global_step += 1
                 reduced_loss = loss.detach().clone()
-                dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG) # will get called on only after word_size steps, and not on every step
+                dist.reduce(reduced_loss, dst=0, op=dist.ReduceOp.AVG)  # will get called on only after word_size steps, and not on every step
                 if self.writer:
                     avg_loss = reduced_loss.item() 
                     self.writer.add_scalar("Train/Loss", avg_loss, global_step)
@@ -151,7 +151,7 @@ class DistributedTrainer:
 
             total_loss += loss
 
-        dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+        dist.reduce(total_loss, dst=0, op=dist.ReduceOp.SUM)
         if self.writer:    
             global_step = self.epochs_ran * self.ep_steps
             avg_loss = total_loss.item() / self.val_steps
